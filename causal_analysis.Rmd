@@ -1,0 +1,1705 @@
+---
+title: "Analyzing heterogeneous effects of loss-versus-gain framing with causal machine learning"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Initialize notebook
+
+Load required package and versions used in this paper
+
+```{r load packages, warning=FALSE, message=FALSE}
+library(tidyverse)       # tidyverse_2.0.0
+library(vtable)          # vtable_1.4.8 
+library(cowplot)         # cowplot_1.1.3
+library(stargazer)       # stargazer_5.2.3 
+library(grf)             # grf_2.4.0 
+library(policytree)      # policytree_1.2.3
+library(maq)             # maq_0.6.0
+library(sampleSelection) # sampleSelection_1.2-12
+library(cobalt)          # cobalt_4.6.1
+library(emmeans)         # emmeans_1.11.2
+library(tools)           # base package
+library(stringr)         # stringr_1.5.1 
+library(fastshap)        # fastshap_0.1.1 
+library(shapviz)         # shapviz_0.10.1  
+library(mgcv)            # mgcv_1.9-1 
+```
+
+Set up workspace
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+rm(list=ls())
+set.seed(42)
+options(scipen=10000)
+```
+
+Constants that are used through out the script
+
+```{r}
+relevant_features = c(
+  "gender",
+  "insurance_holder_age",
+  "has_company_pension_plan",
+  "contract_valuation",
+  "historical_payments_cnt", 
+  "handling_and_moving", 
+  "information_skills", 
+  "working_with_computers", 
+  "constructing", 
+  "management_skills",
+  "working_with_machinery_and_specialised_equipment",
+  "assisting_and_caring",
+  "communication__collaboration_and_creativity"
+  )
+```
+
+Helper function based on: https://grf-labs.github.io/grf/articles/ate_transport.html
+
+```{r}
+average_treatment_effect_test <- function(forest, X.test, p.hat = NULL) {
+  Y.hat <- forest$Y.hat
+  Y.orig <- forest$Y.orig
+  W.hat <- forest$W.hat
+  W.orig <- forest$W.orig
+  n.rct <- length(Y.orig)
+  n.obs <- nrow(X.test)
+
+  if (is.null(p.hat)) {
+    S.forest <- regression_forest(X = rbind(forest$X.orig, X.test),
+                                  Y = c(rep(1, n.rct), rep(0, n.obs)),
+                                  num.trees = 500)
+    p.hat <- predict(S.forest)$predictions[1:n.rct]
+  }
+
+  tau.hat.test <- predict(forest, X.test)$predictions
+  tau.hat.train <- predict(forest)$predictions
+  debiasing.weights <- (1 - p.hat) / p.hat * (W.orig - W.hat) / (W.hat * (1 - W.hat))
+  Y.residual <- Y.orig - (Y.hat + tau.hat.train * (W.orig - W.hat))
+
+  tau.hat <- mean(tau.hat.test) + sum(debiasing.weights * Y.residual) / n.obs
+  sigma2.hat <- var(tau.hat.test) / n.obs + sum(Y.residual^2 * (debiasing.weights / n.obs)^2)
+
+  c(estimate = tau.hat, std.err = sqrt(sigma2.hat))
+}
+```
+
+# Load Data
+
+```{r}
+data_started <- read_csv('data_started.csv')
+data_finished <- read_csv('data_finished.csv')
+```
+
+
+# Summary Stats
+
+Number of participants in the two studies for those who made a payment and for all
+
+```{r}
+data_started %>% 
+  group_by(year) %>% 
+  summarise(n = n())
+
+data_finished %>% 
+  group_by(year) %>% 
+  summarise(n = n())
+```
+
+Overall conversion rate (i.e., those who made a payment vs. all) along conditions and experiments
+
+```{r}
+data_started %>% 
+  summarise(
+    avg_conversion = mean(converted)
+  )
+```
+
+```{r}
+data_started %>% 
+  group_by(year) %>% 
+  summarise(
+    avg_conversion = mean(converted)
+  )
+
+data_started %>% 
+  group_by(year, condition_3lvl) %>% 
+  summarise(
+    avg_conversion = mean(converted)
+  )
+```
+
+Overall payment for those who made a payment along conditions and experiments
+
+```{r}
+data_finished %>%
+  summarise(n = n(), 
+            mean_amount = mean(paid_amount),
+            median_amount = median(paid_amount),
+            sd_amount = sd(paid_amount))
+
+```
+
+```{r}
+data_finished %>% 
+  group_by(year) %>% 
+  summarise(n = n(), 
+            mean_amount = mean(paid_amount),
+            median_amount = median(paid_amount),
+            sd_amount = sd(paid_amount))
+
+data_finished %>% 
+  group_by(year, condition_3lvl) %>% 
+  summarise(n = n(), 
+            mean_amount = mean(paid_amount),
+            median_amount = median(paid_amount),
+            sd_amount = sd(paid_amount))
+```
+
+Covariate summary stats and randomization checks
+
+```{r}
+st(data_started, group = 'condition', vars = relevant_features, group.test = TRUE)
+```
+
+# Causal ML
+
+## DV: Conversion
+
+```{r}
+rm(list=setdiff(ls(), c("relevant_features", "split_ratio", "average_treatment_effect_test", "data_started", "data_finished")))
+set.seed(42)
+options(scipen=10000)
+```
+
+### Fit Causal Forest
+
+Split data into training and test set
+
+```{r}
+train <- data_started %>% filter(year==2021)
+test <- data_started%>% filter(year==2022)
+```
+
+Split data into X, Y, W
+
+```{r}
+Y.train <- train$converted
+W.train <- ifelse(train$condition_3lvl=='loss', 1, 0)
+X.train <- train[relevant_features]
+
+Y.test <- test$converted
+W.test <- ifelse(test$condition_3lvl=='loss', 1, 0)
+X.test <- test[relevant_features]
+```
+
+Fit or load Model
+
+```{r}
+if (file.exists("cf_train_conversion.rds")) {
+  print("Load CF Train")
+  cf.train <- readRDS(file = "cf_train_conversion.rds")
+} else {
+  print("Fit CF Train")
+  cf.train <- causal_forest(X = X.train, Y = Y.train, W = W.train,
+                            honesty = FALSE,
+                            seed = 42)
+  saveRDS(cf.train, file = "cf_train_conversion.rds")
+}
+```
+
+###  ATE
+
+```{r}
+ate <- average_treatment_effect_test(cf.train, X.test)
+print(ate[1])
+print(ate[1]-1.96*ate[2])
+print(ate[1]+1.96*ate[2])
+```
+
+###  CATE
+
+```{r}
+cate.test <- predict(cf.train, X.test, estimate.variance = TRUE)
+cate.test <- cate.test %>%
+  mutate(
+    cate_direction = ifelse(cate.test$predictions>=0, 'positive', 'negative') 
+  )
+
+summary(cate.test$predictions)
+```
+
+Distribution of CATE
+
+```{r}
+cate_p1 <- ggplot(cate.test, aes(x = predictions, fill = cate_direction)) +
+  geom_histogram(binwidth = 0.01, color = "white", boundary  = 0) +
+  scale_fill_manual(name = "Direction", values = c(positive = "#1F77B4", negative = "#A56CBD")) +
+  scale_x_continuous(labels = scales::label_percent(accuracy = 0.01, suffix = " %")) +
+  scale_y_continuous(labels = scales::label_comma()) +
+  labs(x = "CATE (in percent)", y = "Frequency") +
+  geom_vline(xintercept=ate[1]) +
+  geom_vline(xintercept=c(ate[1]-1.96*ate[2],ate[1]+1.96*ate[2]), linetype="dashed") +
+  theme_bw() + 
+  theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12)) +
+  theme(legend.position = "none") +
+  annotate("text", x = 0.15, y = 3000, 
+           label = sprintf("ATE: %.3f%% [95%% CI: %.3f%%, %.3f%%]", 
+                           ate[1]*100, 
+                           (ate[1]-1.96*ate[2])*100, 
+                           (ate[1]+1.96*ate[2])*100)) +
+  
+  annotate("segment", x = 0.10, xend = 0.20, y = 2000, yend = 2000, 
+           arrow = arrow(length = unit(0.3, "cm")), linewidth = 1) +
+  
+  annotate("segment", x = -0.10, xend = -0.20, y = 2000, yend = 2000, 
+           arrow = arrow(length = unit(0.3, "cm")), linewidth = 1) +
+  
+  annotate("text", x = 0.15, y = 1300, 
+           label = "Respond positively\nto loss-framing", size = 4) +
+
+  annotate("text", x = -0.15, y = 1300, 
+           label = "Respond positively\nto gain-framing", size = 4) +
+  
+  coord_cartesian(xlim = c(-0.25, 0.25))
+
+cate_p1
+```
+
+### RATE
+
+```{r}
+if (file.exists("cf_test_conversion.rds")) {
+  print("Load CF Test")
+  cf.test <- readRDS(file = "cf_test_conversion.rds")
+} else {
+  print("Fit CF Test")
+  cf.test <- causal_forest(X = X.test, Y = Y.test, W = W.test,
+                          honesty = FALSE,
+                          seed = 42)
+  saveRDS(cf.test, file = "cf_test_conversion.rds")
+}
+```
+
+```{r}
+rate <- rank_average_treatment_effect(cf.test, cate.test$predictions)
+rate$estimate
+rate$estimate-1.96*rate$std.err
+rate$estimate+1.96*rate$std.err
+```
+
+Targeting Operator Characteristic (TOC) for the CATE-based policy with conversion as the dependent variable
+
+```{r}
+ggplot() +
+  geom_line(mapping = aes(x = q, y = estimate), 
+            data=rate$TOC, 
+            color = "#1F77B4", size = 1) +
+  geom_ribbon(mapping = aes(x = q, y = estimate, ymin = estimate-1.96*std.err, ymax = estimate+1.96*std.err),
+              data=rate$TOC, 
+              fill = "#1F77B4", alpha = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1)) +
+  scale_y_continuous(labels = scales::label_percent(accuracy = 0.01, suffix = " %")) +
+  labs(title = "Targeting Operator Characteristic", x = "Treated Fraction", y = "") +
+  theme_bw() + 
+  theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12))
+
+ggsave("RATE - Conversion.pdf", width = 10, height = 8)
+```
+
+
+### GATE
+
+GATE by CATE sign (+/-)
+
+```{r}
+X.test_tmp <- X.test
+X.test_tmp$cate <- cate.test$predictions
+
+X.test_cate_pos <- X.test_tmp %>% 
+  filter(cate > 0) %>% 
+  select(-cate)
+
+X.test_cate_neg <- X.test_tmp %>% 
+  filter(cate <= 0) %>% 
+  select(-cate)
+
+cate_pos <- average_treatment_effect_test(cf.train, X.test_cate_pos)
+cate_neg <- average_treatment_effect_test(cf.train, X.test_cate_neg)
+
+cate_sign_df <- data.frame(
+  cate_sign = c("Positive", "Negative"),
+  estimate = c(cate_pos[1], cate_neg[1]),
+  se = c(cate_pos[2], cate_neg[2]),
+  n = c(nrow(X.test_cate_pos), nrow(X.test_cate_neg))
+)
+
+cate_sign_df <- cate_sign_df %>% arrange(desc(cate_sign))
+
+gate_p1 <- ggplot(data = cate_sign_df) +
+  geom_col(aes(x = cate_sign, y = estimate, fill = cate_sign)) +
+  scale_fill_manual(values = c(Positive = "#1F77B4", Negative = "#A56CBD")) + 
+  geom_errorbar(aes(x = cate_sign, ymin = estimate - 1.96 * se, ymax = estimate + 1.96 * se), width = 0.1) +
+  geom_text(aes(x = 1, y = -0.01), label = paste("N =", scales::label_number(accuracy = NULL, big.mark = ",")(cate_sign_df[2,"n"]))) +
+  geom_text(aes(x = 2, y = 0.01), label = paste("N =", scales::label_number(accuracy = NULL, big.mark = ",")(cate_sign_df[1,"n"]))) +
+  geom_text(aes(x = 1, y = -0.065), label = paste0(round(cate_sign_df[2,"estimate"]*100,3), " %")) +
+  geom_text(aes(x = 2, y = 0.065), label = paste0(round(cate_sign_df[1,"estimate"]*100,3), " %")) +
+  scale_y_continuous(labels = scales::label_percent(accuracy = 0.01, suffix = " %")) +
+  ylab("Group ATE") +
+  xlab("Causal ML Policy") +
+  theme(legend.position = "none") +
+  scale_x_discrete(labels = c("Negative" = "Not targeted", "Positive" = "Targeted")) +
+  theme_bw() +
+  theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12)) +
+  theme(legend.position = "none") 
+
+gate_p1
+```
+
+GATE by CATE quartiles
+
+```{r}
+X.test_tmp <- X.test
+X.test_tmp$cate <- cate.test$predictions
+X.test_tmp$cate_quartile <- as.factor(ntile(X.test_tmp$cate, 4))
+
+X.test_Q1 <- X.test_tmp %>% 
+  filter(cate_quartile == "1") %>% 
+  select(-cate,-cate_quartile)
+
+X.test_Q2 <- X.test_tmp %>% 
+  filter(cate_quartile == "2") %>% 
+  select(-cate,-cate_quartile)
+
+X.test_Q3 <- X.test_tmp %>% 
+  filter(cate_quartile == "3") %>% 
+  select(-cate,-cate_quartile)
+
+X.test_Q4 <- X.test_tmp %>% 
+  filter(cate_quartile == "4") %>% 
+  select(-cate,-cate_quartile)
+
+gate_q1 <- average_treatment_effect_test(cf.train, X.test_Q1)
+gate_q2 <- average_treatment_effect_test(cf.train, X.test_Q2)
+gate_q3 <- average_treatment_effect_test(cf.train, X.test_Q3)
+gate_q4 <- average_treatment_effect_test(cf.train, X.test_Q4)
+
+gate_quartiles_df <- data.frame(
+  quartile = c("Q1", "Q2", "Q3", "Q4"),
+  estimate = c(gate_q1[1], gate_q2[1], gate_q3[1], gate_q4[1]),
+  se = c(gate_q1[2], gate_q2[2], gate_q3[2], gate_q4[2]),
+  sign = c(as.factor(sign(gate_q1[1])), as.factor(sign(gate_q2[1])), as.factor(sign(gate_q3[1])), as.factor(sign(gate_q4[1]))),
+  n = c(nrow(X.test_Q1), nrow(X.test_Q2), nrow(X.test_Q3), nrow(X.test_Q4))
+)
+
+gate_p2 <- ggplot(data = gate_quartiles_df) +
+  geom_col(aes(x = quartile, y = estimate, fill = sign)) +
+  scale_fill_manual(values = c("-1" = "#A56CBD", "1" = "#1F77B4")) +
+  scale_y_continuous(labels = scales::label_percent(accuracy = 0.01, suffix = " %")) +
+  geom_errorbar(aes(x = quartile, ymin = estimate - 1.96 * se, ymax = estimate + 1.96 * se), width = 0.1) +
+  #ylim(-0.110, 0.110) + 
+  ylab("Group ATE") +
+  xlab("CATE Quartile") +
+  theme_bw() +
+  theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12)) +
+  theme(legend.position = "none") 
+
+gate_p2
+```
+
+```{r}
+plot_grid(cate_p1, gate_p2, gate_p1, labels = c('a', 'b', 'c'), 
+          ncol = 1, align = 'h', 
+          scale = c(.9, .9, .9)
+          )
+
+ggsave("CATE_GATE - Conversion.pdf", width = 10, height = 8)
+```
+
+### XAI
+
+Variable importance in causal forest model (conversion)
+
+```{r}
+vi <- variable_importance(cf.train)
+vi_df <- data.frame(vi)
+vi_df$variable <- colnames(cf.train$X.orig)
+
+vi_df <- vi_df %>% 
+  select("variable", "vi") %>% 
+  arrange(desc(vi))
+
+xai_p1 <- ggplot(vi_df, aes(x = reorder(variable, vi), y = vi)) +
+  geom_bar(stat = "identity", fill = "#1F77B4") +
+  coord_flip() +
+  labs(x = "Covariate", y = "Variable Importance") +
+  scale_x_discrete(
+    labels = function(x) toTitleCase(gsub("_", " ", x))
+  ) +
+  theme_bw() + 
+  theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12))
+
+xai_p1
+```
+
+Partial dependence plots for causal forest mode (conversion)
+
+```{r}
+p_list <- list()
+for (var in vi_df$variable) {
+
+  if (var == "gender" | var == "has_company_pension_plan") {
+    range <- seq(0, 1, by = 1)
+  } else {
+    range <- seq(min(X.test[[var]]), max(X.test[[var]]), length.out = 4)    
+  }
+
+  range <- seq(min(X.test[[var]]), max(X.test[[var]]), length.out = 4)
+  
+  results <- lapply(range, function(val) {
+    X_mod <- X.test
+    X_mod[[var]] <- val
+    
+    preds <- predict(cf.train, X_mod, estimate.variance = TRUE)
+    
+    pred_point <- mean(preds$predictions)
+    pred_var_mean <- mean(preds$variance.estimates) / nrow(X_mod)
+    pred_se <- sqrt(pred_var_mean)
+    
+    pred_lb <- pred_point - 1.96 * pred_se
+    pred_ub <- pred_point + 1.96 * pred_se
+    
+    data.frame(
+      working_with_computers = val,
+      pred_point = pred_point,
+      pred_lb = pred_lb,
+      pred_ub = pred_ub
+    )
+  })
+  
+  pdp_df <- do.call(rbind, results)
+  names(pdp_df)[1] <- "value"
+
+  p <- ggplot(pdp_df, aes(x = value, y = pred_point)) +
+    geom_line(color = "#1F77B4", size = 1) +
+    geom_ribbon(aes(ymin = pred_lb, ymax = pred_ub), fill = "#1F77B4", alpha = 0.3) +
+    scale_y_continuous(labels = scales::label_percent(accuracy = 0.01, suffix = " %")) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+    labs(x = str_wrap(toTitleCase(gsub("_", " ", var)), width = 12), y = "CATE") +
+    #ylim(y = c(-500, 1200)) +
+    theme_bw() + 
+    theme(text = element_text(size = 10), axis.text.x=element_text(size=8), axis.text.y=element_text(size=8))
+
+  p_list[[var]] <- p
+  
+}
+
+p_grid <- plot_grid(plotlist = p_list, ncol = 5, align = 'hv')
+p_grid
+```
+
+```{r}
+plot_grid(
+  xai_p1, 
+  p_grid,
+  labels = c('a', 'b'),
+  ncol = 1,
+  align = "h",
+  scale = c(.9, .9),
+  rel_heights = c(0.35, 0.65) 
+)
+
+ggsave("XAI PDP - Conversion Combined.pdf", width = 10, height = 12)
+
+```
+
+SHAP
+
+```{r}
+# Prediction wrapper for grf causal forest
+pred_fun <- function(object, newdata, ...) {
+  predict(object, newdata, ...)$predictions
+}
+
+# Compute SHAP values with fastshap
+fs <- fastshap::explain(
+  object       = cf.train,
+  X            = X.test,
+  pred_wrapper = pred_fun,
+  nsim = 10
+)
+
+# Turn fastshap result into a shapviz object
+shap_values <- shapviz(fs, X = X.test)
+
+sv_importance(shap_values, kind = "bee")
+ggsave("SHAP - Beeswarm Conversion.png", width = 10, height = 8)
+
+```
+
+### Economic Impact
+
+Data preparation
+
+```{r}
+X.test_tmp <- X.test
+X.test_tmp$cate <- cate.test$predictions
+X.test_tmp$condition <- W.test
+X.test_tmp$converted <- Y.test
+```
+
+#### Random assignment
+
+Conversion rate under randomized assignment
+
+```{r}
+X.test_tmp %>% 
+  summarise(n = n(), mean_converted = mean(converted))
+```
+
+#### All loss
+
+Conversion rate when all participants are assigned to loss-framing
+
+```{r}
+X.test_tmp %>% 
+  filter(condition == 1) %>%
+  summarise(n = n(), mean_converted = mean(converted))
+```
+
+#### All gain
+
+Conversion rate when all participants are assigned to gain-framing
+
+```{r}
+X.test_tmp %>% 
+  filter(condition == 0) %>%
+  summarise(n = n(), mean_converted = mean(converted))
+```
+
+#### By CATE sign (+/-)
+
+Conversion rate for optimal assignment to gain- vs. loss-framing
+
+```{r}
+# Received gain message and have positive CATE (i.e., should have received a loss message)
+X.test_tmp %>% 
+  filter(condition == 0) %>%
+  filter(cate > 0) %>%
+  summarise(n = n(), 
+            base = mean(converted),
+            policy_cate = base + cate_pos[1]) # estimated conversion rate if they had received a loss message instead
+
+# Received gain message and have negative CATE (i.e., should have received a gain message)
+X.test_tmp %>% 
+  filter(condition == 0) %>%
+  filter(cate <= 0) %>%
+  summarise(n = n(), 
+            base = mean(converted),
+            policy_cate = base # nothing to add because they already got the right message
+            )
+```
+
+#### By gender
+
+```{r}
+
+X.test_tmp <- X.test
+
+X.test_gender_male <- X.test_tmp %>%
+  filter(gender == 0)
+
+X.test_gender_female <- X.test_tmp %>%
+  filter(gender == 1)
+
+gender_male <- average_treatment_effect_test(cf.train, X.test_gender_male)
+gender_female <- average_treatment_effect_test(cf.train, X.test_gender_female)
+
+gender_df <- data.frame(
+  gender = c("Male", "Female"),
+  estimate = c(gender_male[1], gender_female[1]),
+  se = c(gender_male[2], gender_female[2]),
+  n = c(nrow(X.test_gender_male), nrow(X.test_gender_female))
+)
+
+gender_df <- gender_df %>% arrange(desc(gender))
+
+gate_p3 <- ggplot(data = gender_df) +
+  geom_col(aes(x = gender, y = estimate, fill = gender)) +
+  scale_fill_manual(values = c(Male = "#1F77B4", Female = "#A56CBD")) +
+  geom_errorbar(aes(x = gender, ymin = estimate - 1.96 * se, ymax = estimate + 1.96 * se), width = 0.1) +
+  geom_text(aes(x = 1, y = -0.015), label = paste("N =", scales::label_number(accuracy = NULL, big.mark = ",")(gender_df[2,"n"]))) +
+  geom_text(aes(x = 2, y = -0.015), label = paste("N =", scales::label_number(accuracy = NULL, big.mark = ",")(gender_df[1,"n"]))) +
+  geom_text(aes(x = 1, y = 0.02), label = paste0(round(gender_df[2,"estimate"]*100,3), " %")) + # NEW
+  geom_text(aes(x = 2, y = 0.02), label = paste0(round(gender_df[1,"estimate"]*100,3), " %")) + # NEW
+  ylab("Group ATE") +
+  xlab("Gender") +
+  theme(legend.position = "none") +
+  scale_x_discrete(labels = c("Negative" = expression(pi(x[i]) == 0), "Positive" = expression(pi(x[i]) == 1))) +
+  scale_y_continuous(labels = scales::label_percent(accuracy = 0.01, suffix = " %")) + # NEW
+  theme_bw() +
+  theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12)) +
+  theme(legend.position = "none")
+
+gate_p3
+
+ggsave("GATE by Gender - Conversion.pdf", width = 10, height = 8)
+```
+
+```{r}
+# female -> loss
+# male -> gain
+
+X.test_tmp$cate <- cate.test$predictions
+X.test_tmp$condition <- W.test
+X.test_tmp$converted <- Y.test
+
+# Received gain message and are male (i.e., should have received a gain message)
+X.test_tmp %>% 
+  filter(condition == 0) %>%
+  filter(gender == 0) %>%
+  summarise(n = n(), 
+            gender = mean(gender),
+            base = mean(converted),
+            policy_cate = base) # nothing to add because they already got the right message
+
+# Received gain message and are female (i.e., should have received a loss message)
+X.test_tmp %>% 
+  filter(condition == 0) %>%
+  filter(gender == 1) %>%
+  summarise(n = n(), 
+            gender = mean(gender),
+            base = mean(converted),
+            policy_cate = base + gender_female[1] # estimated conversion rate if they had received a loss message instead
+            )
+```
+
+```{r}
+rate <- rank_average_treatment_effect(cf.test, X.test_tmp$gender)
+rate$estimate
+rate$estimate-1.96*rate$std.err
+rate$estimate+1.96*rate$std.err
+
+ggplot() +
+  geom_line(mapping = aes(x = q, y = estimate), 
+            data=rate$TOC, 
+            color = "#1F77B4", size = 1) +
+  geom_ribbon(mapping = aes(x = q, y = estimate, ymin = estimate-1.96*std.err, ymax = estimate+1.96*std.err),
+              data=rate$TOC, 
+              fill = "#1F77B4", alpha = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1)) +
+  scale_y_continuous(labels = scales::label_percent(accuracy = 0.01, suffix = " %")) + # NEW
+  labs(title = "Targeting Operator Characteristic", x = "Treated Fraction", y = "") +
+  theme_bw() + 
+  theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12))
+
+ggsave("RATE by Gender - Conversion.pdf", width = 10, height = 8)
+```
+
+#### By contract valuation (wealth)
+
+```{r}
+X.test_tmp <- X.test
+
+X.test_policy_low <- X.test_tmp %>%
+  filter(contract_valuation <= median(X.train$contract_valuation))
+
+X.test_policy_high <- X.test_tmp %>%
+  filter(contract_valuation > median(X.train$contract_valuation))
+
+policy_low <- average_treatment_effect_test(cf.train, X.test_policy_low)
+policy_high <- average_treatment_effect_test(cf.train, X.test_policy_high)
+
+policy_df <- data.frame(
+  policy = c("Below Median", "Above Median"),
+  estimate = c(policy_low[1], policy_high[1]),
+  se = c(policy_low[2], policy_high[2]),
+  n = c(nrow(X.test_policy_low), nrow(X.test_policy_high))
+)
+
+policy_df$policy <- factor(policy_df$policy, levels = c("Below Median", "Above Median"))
+
+gate_p5 <- ggplot(data = policy_df) +
+  geom_col(aes(x = policy, y = estimate, fill = policy)) +
+  scale_fill_manual(values = c(`Below Median` = "#A56CBD", `Above Median` = "#1F77B4")) +
+  geom_errorbar(aes(x = policy, ymin = estimate - 1.96 * se, ymax = estimate + 1.96 * se), width = 0.1) +
+  geom_text(aes(x = 1, y = -0.015), label = paste("N =", scales::label_number(accuracy = NULL, big.mark = ",")(policy_df[1,"n"]))) +
+  geom_text(aes(x = 2, y = -0.015), label = paste("N =", scales::label_number(accuracy = NULL, big.mark = ",")(policy_df[2,"n"]))) +
+  geom_text(aes(x = 1, y = 0.025), label = paste0(round(policy_df[1,"estimate"]*100,3), " %")) + # NEW
+  geom_text(aes(x = 2, y = 0.025), label = paste0(round(policy_df[2,"estimate"]*100,3), " %")) + # NEW
+  ylab("Group ATE") +
+  xlab("Contract Valuation") +
+  theme(legend.position = "none") +
+  scale_x_discrete(labels = c("Negative" = expression(pi(x[i]) == 0), "Positive" = expression(pi(x[i]) == 1))) +
+  scale_y_continuous(labels = scales::label_percent(accuracy = 0.01, suffix = " %")) + # NEW
+  theme_bw() +
+  theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12)) +
+  theme(legend.position = "none")
+
+gate_p5
+
+ggsave("GATE by Contract Valuation - Conversion.pdf", width = 10, height = 8)
+```
+
+```{r}
+# low -> loss
+# high -> gain
+
+X.test_tmp$cate <- cate.test$predictions
+X.test_tmp$condition <- W.test
+X.test_tmp$converted <- Y.test
+
+# Received gain message and have low value policy (i.e., should have received a loss message)
+X.test_tmp %>% 
+  filter(condition == 0) %>%
+  filter(contract_valuation <= median(X.train$contract_valuation)) %>%
+  summarise(n = n(), 
+            valuation = mean(contract_valuation),
+            base = mean(converted),
+            policy_cate = base + policy_low[1]) # estimated conversion rate if they had received a loss message instead
+
+# Received gain message and have high value policy (i.e., should have received a gain message)
+X.test_tmp %>% 
+  filter(condition == 0) %>%
+  filter(contract_valuation > median(X.train$contract_valuation)) %>%
+  summarise(n = n(), 
+            valuation = mean(contract_valuation),
+            base = mean(converted),
+            policy_cate = base # nothing to add because they already got the right message
+            )
+```
+
+```{r}
+rate <- rank_average_treatment_effect(cf.test, -1*X.test_tmp$contract_valuation)
+rate$estimate
+rate$estimate-1.96*rate$std.err
+rate$estimate+1.96*rate$std.err
+
+ggplot() +
+  geom_line(mapping = aes(x = q, y = estimate), 
+            data=rate$TOC, 
+            color = "#1F77B4", size = 1) +
+  geom_ribbon(mapping = aes(x = q, y = estimate, ymin = estimate-1.96*std.err, ymax = estimate+1.96*std.err),
+              data=rate$TOC, 
+              fill = "#1F77B4", alpha = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1)) +
+  scale_y_continuous(labels = scales::label_percent(accuracy = 0.01, suffix = " %")) + # NEW
+  labs(title = "Targeting Operator Characteristic", x = "Treated Fraction", y = "") +
+  theme_bw() + 
+  theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12))
+
+ggsave("RATE by Contract Valuation - Conversion.pdf", width = 10, height = 8)
+```
+
+#### By management skills (financial literacy)
+
+```{r}
+X.test_tmp <- X.test
+
+X.test_mng_low <- X.test_tmp %>%
+  filter(management_skills <= median(X.train$management_skills))
+
+X.test_mng_high <- X.test_tmp %>%
+  filter(management_skills > median(X.train$management_skills))
+
+mng_low <- average_treatment_effect_test(cf.train, X.test_mng_low)
+mng_high <- average_treatment_effect_test(cf.train, X.test_mng_high)
+
+mng_df <- data.frame(
+  mng_skills = c("Below Median", "Above Median"),
+  estimate = c(mng_low[1], mng_high[1]),
+  se = c(mng_low[2], mng_high[2]),
+  n = c(nrow(X.test_mng_low), nrow(X.test_mng_high))
+)
+
+mng_df$mng_skills <- factor(mng_df$mng_skills, levels = c("Below Median", "Above Median"))
+
+gate_p5 <- ggplot(data = mng_df) +
+  geom_col(aes(x = mng_skills, y = estimate, fill = mng_skills)) +
+  scale_fill_manual(values = c(`Below Median` = "#A56CBD", `Above Median` = "#1F77B4")) +
+  geom_errorbar(aes(x = mng_skills, ymin = estimate - 1.96 * se, ymax = estimate + 1.96 * se), width = 0.1) +
+  geom_text(aes(x = 1, y = -0.015), label = paste("N =", scales::label_number(accuracy = NULL, big.mark = ",")(mng_df[1,"n"]))) +
+  geom_text(aes(x = 2, y = -0.015), label = paste("N =", scales::label_number(accuracy = NULL, big.mark = ",")(mng_df[2,"n"]))) +
+  geom_text(aes(x = 1, y = 0.025), label = paste0(round(mng_df[1,"estimate"]*100,3), " %")) + # NEW
+  geom_text(aes(x = 2, y = 0.025), label = paste0(round(mng_df[2,"estimate"]*100,3), " %")) + # NEW
+  ylab("Group ATE") +
+  xlab("Management Skills") +
+  theme(legend.position = "none") +
+  scale_x_discrete(labels = c("Negative" = expression(pi(x[i]) == 0), "Positive" = expression(pi(x[i]) == 1))) +
+  scale_y_continuous(labels = scales::label_percent(accuracy = 0.01, suffix = " %")) + #NEW
+  theme_bw() +
+  theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12)) +
+  theme(legend.position = "none")
+
+gate_p5
+
+ggsave("GATE by Mng Skills - Conversion.pdf", width = 10, height = 8)
+```
+
+```{r}
+# low -> loss
+# high -> gain
+
+X.test_tmp$cate <- cate.test$predictions
+X.test_tmp$condition <- W.test
+X.test_tmp$converted <- Y.test
+
+# Received gain message and have high management_skills (i.e., should have received a gain message)
+X.test_tmp %>% 
+  filter(condition == 0) %>%
+  filter(management_skills > median(X.train$management_skills)) %>%
+  summarise(n = n(), 
+            skills = mean(management_skills),
+            base = mean(converted),
+            policy_cate = base) # nothing to add because they already got the right message
+
+# Received gain message and low management_skills (i.e., should have received a loss message)
+X.test_tmp %>% 
+  filter(condition == 0) %>%
+  filter(management_skills <= median(X.train$management_skills)) %>%
+  summarise(n = n(), 
+            skills = mean(management_skills),
+            base = mean(converted),
+            policy_cate = base + mng_low[1] # estimated conversion rate if they had received a loss message instead
+            )
+```
+
+```{r}
+rate <- rank_average_treatment_effect(cf.test, -1*X.test_tmp$management_skills)
+rate$estimate
+rate$estimate-1.96*rate$std.err
+rate$estimate+1.96*rate$std.err
+
+ggplot() +
+  geom_line(mapping = aes(x = q, y = estimate), 
+            data=rate$TOC, 
+            color = "#1F77B4", size = 1) +
+  geom_ribbon(mapping = aes(x = q, y = estimate, ymin = estimate-1.96*std.err, ymax = estimate+1.96*std.err),
+              data=rate$TOC, 
+              fill = "#1F77B4", alpha = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1)) +
+  scale_y_continuous(labels = scales::label_percent(accuracy = 0.01, suffix = " %")) + #NEW
+  labs(title = "Targeting Operator Characteristic", x = "Treated Fraction", y = "") +
+  theme_bw() + 
+  theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12))
+
+ggsave("RATE by Mng Skills - Conversion.pdf", width = 10, height = 8)
+```
+
+## DV: Saving Amount
+
+```{r}
+rm(list=setdiff(ls(), c("relevant_features", "split_ratio", "average_treatment_effect_test", "data_started", "data_finished")))
+set.seed(42)
+options(scipen=10000)
+```
+
+### Fit Causal Forest
+
+Split data into training and test set
+
+```{r}
+train <- data_finished %>% filter(year==2021)
+test <- data_finished %>% filter(year==2022)
+```
+
+Split data into X, Y, W
+
+```{r}
+Y.train <- train$paid_amount
+W.train <- ifelse(train$condition_3lvl=='loss', 1, 0)
+X.train <- train[relevant_features]
+
+Y.test <- test$paid_amount
+W.test <- ifelse(test$condition_3lvl=='loss', 1, 0)
+X.test <- test[relevant_features]
+```
+
+Load or fit model
+
+```{r}
+if (file.exists("cf_train_saving_amount.rds")) {
+  print("Load CF Train")
+  cf.train <- readRDS(file = "cf_train_saving_amount.rds")
+} else {
+  print("Fit CF Train")
+  cf.train <- causal_forest(X = X.train, Y = Y.train, W = W.train,
+                            honesty = FALSE,
+                            seed = 42)
+  saveRDS(cf.train, file = "cf_train_saving_amount.rds")
+}
+```
+
+###  ATE
+
+```{r}
+ate <- average_treatment_effect_test(cf.train, X.test)
+
+print(ate[1])
+print(ate[1]-1.96*ate[2])
+print(ate[1]+1.96*ate[2])
+```
+
+###  CATE
+
+```{r}
+cate.test <- predict(cf.train, X.test, estimate.variance = TRUE)
+cate.test <- cate.test %>%
+  mutate(
+    cate_direction = ifelse(cate.test$predictions>=0, 'positive', 'negative') 
+  )
+
+summary(cate.test$predictions)
+```
+
+```{r}
+cate_p1 <- ggplot(cate.test, aes(x = predictions, fill = cate_direction)) +
+  geom_histogram(
+    binwidth = 100, 
+    #alpha = 0.8, 
+    color = "white",
+    boundary  = 0,              # force a bin edge at exactly zero 
+    ) +
+  scale_fill_manual(
+    name = "Direction",
+    values = c(positive = "#1F77B4", negative = "#A56CBD")
+  ) +
+  labs(
+    # x = expression(tau),
+    x = "CATE (in €)",
+    y = "Frequency"
+  ) +
+  scale_x_continuous(labels = scales::label_comma()) +
+  geom_vline(xintercept=ate[1]) +
+  geom_vline(xintercept=c(ate[1]-1.96*ate[2],ate[1]+1.96*ate[2]), linetype="dashed") +
+  theme_bw() + 
+  theme(legend.position = "none") +
+  theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12)) +
+  annotate("text", x = 2000, y = 60, label = sprintf("ATE: %.2f [95%% CI: %.2f, %.2f]", ate[1], ate[1]-1.96*ate[2], ate[1]+1.96*ate[2])) +
+  
+  annotate("segment", x = 1000, xend = 3000, y = 40, yend = 40, 
+           arrow = arrow(length = unit(0.3, "cm")), linewidth = 1) +
+  
+  annotate("segment", x = -1000, xend = -3000, y = 40, yend = 40, 
+           arrow = arrow(length = unit(0.3, "cm")), linewidth = 1) +
+  
+  annotate("text", x = 2000, y = 30, 
+           label = "Respond positively\nto loss-framing", size = 4) +
+
+  annotate("text", x = -2000, y = 30, 
+           label = "Respond positively\nto gain-framing", size = 4) +
+  
+  coord_cartesian(xlim = c(-3100, 3100))
+
+cate_p1
+```
+
+### RATE
+
+```{r}
+if (file.exists("cf_test_saving_amount.rds")) {
+  print("Load CF Test")
+  cf.test <- readRDS(file = "cf_test_saving_amount.rds")
+} else {
+  print("Fit CF Test")
+  cf.test <- causal_forest(X = X.test, Y = Y.test, W = W.test,
+                          honesty = FALSE,
+                          seed = 42)
+  saveRDS(cf.test, file = "cf_test_saving_amount.rds")
+}
+```
+
+```{r}
+rate <- rank_average_treatment_effect(cf.test, cate.test$predictions)
+rate$estimate
+rate$estimate-1.96*rate$std.err
+rate$estimate+1.96*rate$std.err
+```
+
+```{r}
+ggplot(aes(x = q, y = estimate), data=rate$TOC) +
+  geom_line(color = "#1F77B4", size = 1) +
+  geom_ribbon(aes(ymin = estimate-1.96*std.err, ymax = estimate+1.96*std.err), fill = "#1F77B4", alpha = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1)) +
+  labs(title = "Targeting Operator Characteristic", x = "Treated Fraction", y = "") +
+  theme_bw() + 
+  theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12))
+
+ggsave("RATE - Saving Amount.png", width = 10, height = 8)
+```
+
+### GATE
+
+```{r}
+X.test_tmp <- X.test
+X.test_tmp$cate <- cate.test$predictions
+
+X.test_cate_pos <- X.test_tmp %>% 
+  filter(cate > 0) %>% 
+  select(-cate)
+
+X.test_cate_neg <- X.test_tmp %>% 
+  filter(cate <= 0) %>% 
+  select(-cate)
+
+cate_pos <- average_treatment_effect_test(cf.train, X.test_cate_pos)
+cate_neg <- average_treatment_effect_test(cf.train, X.test_cate_neg)
+
+cate_sign_df <- data.frame(
+  sign = c("Positive", "Negative"),
+  estimate = c(cate_pos[1], cate_neg[1]),
+  se = c(cate_pos[2], cate_neg[2]),
+  n = c(nrow(X.test_cate_pos), nrow(X.test_cate_neg))
+)
+
+cate_sign_df <- cate_sign_df %>% arrange(desc(sign))
+
+gate_p1 <- ggplot(data = cate_sign_df) +
+  geom_col(aes(x = sign, y = estimate, fill = sign)) +
+  scale_fill_manual(values = c(Positive = "#1F77B4", Negative = "#A56CBD")) +
+  geom_errorbar(aes(x = sign, ymin = estimate - 1.96 * se, ymax = estimate + 1.96 * se), width = 0.1) +
+  scale_y_continuous(labels = scales::label_comma()) +
+  geom_text(aes(x = 1, y = -100), label = paste("N =", scales::label_number(accuracy = NULL, big.mark = ",")(cate_sign_df[2,"n"]))) +
+  geom_text(aes(x = 2, y = 100), label = paste("N =", scales::label_number(accuracy = NULL, big.mark = ",")(cate_sign_df[1,"n"]))) +
+  geom_text(aes(x = 1, y = -1100), label = round(cate_sign_df[2,"estimate"],2)) +
+  geom_text(aes(x = 2, y = 1200), label = round(cate_sign_df[1,"estimate"],2)) +
+  ylab("Group ATE") +
+  xlab("Causal ML Policy") +
+  #ylim(-1800, 1800) +
+  # scale_x_discrete(labels = c("Negative" = expression(pi(x[i]) == 0), "Positive" = expression(pi(x[i]) == 1))) +
+  scale_x_discrete(labels = c("Negative" = "Not targeted", "Positive" = "Targeted")) +
+  theme(legend.position = "none") + 
+  theme_bw() +
+  theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12)) +
+  theme(legend.position = "none") 
+
+gate_p1
+```
+
+Additional CATE-based descriptive statistics
+
+```{r}
+detailed_proportions <- X.test_tmp %>% 
+  summarise(
+    # pos/neg proportions
+    prop_positive = mean(cate > 0, na.rm = TRUE),
+    prop_negative = mean(cate < 0, na.rm = TRUE),
+    
+    # interesting thresholds
+    prop_gt_500   = mean(cate > 500, na.rm = TRUE),
+    prop_gt_1000  = mean(cate > 1000, na.rm = TRUE),
+    prop_lt_neg500 = mean(cate < -500, na.rm = TRUE)
+  )
+
+detailed_proportions
+```
+
+GATE by CATE quartiles
+
+```{r}
+X.test_tmp <- X.test
+X.test_tmp$cate <- cate.test$predictions
+X.test_tmp$cate_quartile <- as.factor(ntile(cate.test$predictions, 4))
+
+X.test_Q1 <- X.test_tmp %>% 
+  filter(cate_quartile == 1) %>% 
+  select(-cate,-cate_quartile)
+
+X.test_Q2 <- X.test_tmp %>% 
+  filter(cate_quartile == 2) %>% 
+  select(-cate,-cate_quartile)
+
+X.test_Q3 <- X.test_tmp %>% 
+  filter(cate_quartile == 3) %>% 
+  select(-cate,-cate_quartile)
+
+X.test_Q4 <- X.test_tmp %>% 
+  filter(cate_quartile == 4) %>% 
+  select(-cate,-cate_quartile)
+
+gate_q1 <- average_treatment_effect_test(cf.train, X.test_Q1)
+gate_q2 <- average_treatment_effect_test(cf.train, X.test_Q2)
+gate_q3 <- average_treatment_effect_test(cf.train, X.test_Q3)
+gate_q4 <- average_treatment_effect_test(cf.train, X.test_Q4)
+
+gate_quartiles_df <- data.frame(
+  quartile = c("Q1", "Q2", "Q3", "Q4"),
+  estimate = c(gate_q1[1], gate_q2[1], gate_q3[1], gate_q4[1]),
+  se = c(gate_q1[2], gate_q2[2], gate_q3[2], gate_q4[2]),
+  sign = c(as.factor(sign(gate_q1[1])), as.factor(sign(gate_q2[1])), as.factor(sign(gate_q3[1])), as.factor(sign(gate_q4[1]))),
+  n = c(nrow(X.test_Q1), nrow(X.test_Q2), nrow(X.test_Q3), nrow(X.test_Q4))
+)
+
+gate_p2 <- ggplot(data = gate_quartiles_df) +
+  geom_col(aes(x = quartile, y = estimate, fill = sign)) +
+  scale_fill_manual(values = c("-1" = "#A56CBD", "1" = "#1F77B4")) +
+  scale_y_continuous(labels = scales::label_comma()) +
+  geom_errorbar(aes(x = quartile, ymin = estimate - 1.96 * se, ymax = estimate + 1.96 * se), width = 0.1) +
+ #ylim(-2900, 2900) + 
+  ylab("Group ATE") +
+  xlab("CATE Quartile") +
+  theme_bw() +
+  theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12)) +
+  theme(legend.position = "none") 
+
+gate_p2
+```
+
+```{r}
+plot_grid(cate_p1, gate_p2, gate_p1, labels = c('a', 'b', 'c'), 
+          ncol = 1, align = 'h', 
+          scale = c(.9, .9, .9)
+          )
+
+ggsave("CATE_GATE - Saving Amount.pdf", width = 10, height = 8)
+```
+
+### XAI
+
+Variable importance for causal forest (paid amount)
+
+```{r}
+vi <- variable_importance(cf.train)
+vi_df <- data.frame(vi)
+vi_df$variable <- colnames(cf.train$X.orig)
+
+vi_df <- vi_df %>% 
+  select("variable", "vi") %>% 
+  arrange(desc(vi))
+
+xai_p1 <- ggplot(vi_df, aes(x = reorder(variable, vi), y = vi)) +
+  geom_bar(stat = "identity", fill = "#1F77B4") +
+  coord_flip() +
+  labs(x = "Covariate", y = "Variable Importance") +
+  scale_x_discrete(
+    labels = function(x) toTitleCase(gsub("_", " ", x))
+  ) +
+  theme_bw() + 
+  theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12))
+
+xai_p1
+```
+
+Partial dependence plots for causal forest mode (paid amount)
+
+```{r}
+p_list <- list()
+for (var in vi_df$variable) {
+
+  if (var == "gender" | var == "has_company_pension_plan") {
+    range <- seq(0, 1, by = 1)
+  } else {
+    range <- seq(min(X.test[[var]]), max(X.test[[var]]), length.out = 4)    
+  }
+
+  range <- seq(min(X.test[[var]]), max(X.test[[var]]), length.out = 4)
+  
+  results <- lapply(range, function(val) {
+    X_mod <- X.test
+    X_mod[[var]] <- val
+    
+    preds <- predict(cf.train, X_mod, estimate.variance = TRUE)
+    
+    pred_point <- mean(preds$predictions)
+    pred_var_mean <- mean(preds$variance.estimates) / nrow(X_mod)
+    pred_se <- sqrt(pred_var_mean)
+    
+    pred_lb <- pred_point - 1.96 * pred_se
+    pred_ub <- pred_point + 1.96 * pred_se
+    
+    data.frame(
+      working_with_computers = val,
+      pred_point = pred_point,
+      pred_lb = pred_lb,
+      pred_ub = pred_ub
+    )
+  })
+  
+  pdp_df <- do.call(rbind, results)
+  names(pdp_df)[1] <- "value"
+
+  p <- ggplot(pdp_df, aes(x = value, y = pred_point)) +
+    geom_line(color = "#1F77B4", size = 1) +
+    geom_ribbon(aes(ymin = pred_lb, ymax = pred_ub), fill = "#1F77B4", alpha = 0.3) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+    labs(x = str_wrap(toTitleCase(gsub("_", " ", var)), width = 12), y = "CATE") +
+    #ylim(y = c(-500, 1200)) +
+    theme_bw() + 
+    theme(text = element_text(size = 10), axis.text.x=element_text(size=8), axis.text.y=element_text(size=8))
+
+  p_list[[var]] <- p
+  
+}
+
+p_grid <- plot_grid(plotlist = p_list, ncol = 5, align = 'hv')
+p_grid
+```
+
+```{r}
+plot_grid(
+  xai_p1, 
+  p_grid,
+  labels = c('a', 'b'),
+  ncol = 1,
+  align = "h",
+  scale = c(.9, .9),
+  rel_heights = c(0.35, 0.65)
+)
+
+ggsave("XAI PDP - Saving Amount Combined.pdf", width = 10, height = 12)
+```
+
+SHAP
+
+```{r}
+# Prediction wrapper for grf causal forest
+pred_fun <- function(object, newdata, ...) {
+  predict(object, newdata, ...)$predictions
+}
+
+# Compute SHAP values with fastshap
+fs <- fastshap::explain(
+  object       = cf.train,
+  X            = X.test,
+  pred_wrapper = pred_fun,
+  nsim = 10
+)
+
+# Turn fastshap result into a shapviz object
+shap_values <- shapviz(fs, X = X.test)
+
+# Global importance plots
+#sv_importance(shap_values)
+#ggsave("SHAP - PDP Saving Amount.png", width = 10, height = 8)
+
+sv_importance(shap_values, kind = "bee")
+ggsave("SHAP - Beeswarm Saving Amount.png", width = 10, height = 8)
+
+```
+
+### Economic Impact
+
+#### Random assignment
+
+Paid amount under randomized assignment
+
+```{r}
+X.test_tmp <- X.test
+X.test_tmp$cate <- cate.test$predictions
+X.test_tmp$condition <- W.test
+X.test_tmp$payment <- Y.test
+
+X.test_tmp %>% 
+  summarise(n = n(), mean_payment = mean(payment))
+```
+
+#### All loss
+
+Paid amount when all participants are assigned to loss-framing
+
+```{r}
+X.test_tmp %>% 
+  filter(condition == 1) %>%
+  summarise(n = n(), mean_payment = mean(payment))
+```
+
+#### All gain
+
+Paid amount when all participants are assigned to gain-framing
+
+```{r}
+X.test_tmp %>% 
+  filter(condition == 0) %>%
+  summarise(n = n(), mean_payment = mean(payment))
+```
+
+#### By CATE sign (+/-)
+
+Paid amount for optimal assignment to gain- vs. loss-framing
+
+```{r}
+# Received gain message and have positive CATE (i.e., should have received a loss message)
+X.test_tmp %>% 
+  filter(condition == 0) %>%
+  filter(cate > 0) %>%
+  summarise(n = n(), 
+            base = mean(payment),
+            delta = base + cate_pos[1]) # estimated saving if they had received a loss message instead
+
+# Received gain message and have negative CATE (i.e., should have received a gain message)
+X.test_tmp %>% 
+  filter(condition == 0) %>%
+  filter(cate <= 0) %>%
+  summarise(n = n(), 
+            base = mean(payment),
+            delta = base # nothing to add because they already got the right message
+            )
+```
+
+#### By gender
+
+```{r}
+X.test_tmp <- X.test
+
+X.test_gender_male <- X.test_tmp %>%
+  filter(gender == 0)
+
+X.test_gender_female <- X.test_tmp %>%
+  filter(gender == 1)
+
+gender_male <- average_treatment_effect_test(cf.train, X.test_gender_male)
+gender_female <- average_treatment_effect_test(cf.train, X.test_gender_female)
+
+gender_df <- data.frame(
+  gender = c("Male", "Female"),
+  estimate = c(gender_male[1], gender_female[1]),
+  se = c(gender_male[2], gender_female[2]),
+  n = c(nrow(X.test_gender_male), nrow(X.test_gender_female))
+)
+
+gender_df <- gender_df %>% arrange(desc(gender))
+
+gate_p3 <- ggplot(data = gender_df) +
+  geom_col(aes(x = gender, y = estimate, fill = gender)) +
+  scale_fill_manual(values = c(Male = "#1F77B4", Female = "#A56CBD")) +
+  geom_errorbar(aes(x = gender, ymin = estimate - 1.96 * se, ymax = estimate + 1.96 * se), width = 0.1) +
+  geom_text(aes(x = 1, y = -500), label = paste("N =", scales::label_number(accuracy = NULL, big.mark = ",")(gender_df[2,"n"]))) +
+  geom_text(aes(x = 2, y = -500), label = paste("N =", scales::label_number(accuracy = NULL, big.mark = ",")(gender_df[1,"n"]))) +
+  geom_text(aes(x = 1, y = 800), label = round(gender_df[2,"estimate"],3)) +
+  geom_text(aes(x = 2, y = 800), label = round(gender_df[1,"estimate"],3)) +
+  ylab("Group ATE") +
+  xlab("Gender") +
+  theme(legend.position = "none") +
+  scale_x_discrete(labels = c("Negative" = expression(pi(x[i]) == 0), "Positive" = expression(pi(x[i]) == 1))) +
+  theme_bw() +
+  theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12)) +
+  theme(legend.position = "none")
+
+gate_p3
+
+ggsave("GATE by Gender - Saving Amount.png", width = 10, height = 8)
+```
+
+```{r}
+# female -> loss
+# male -> gain
+
+X.test_tmp$cate <- cate.test$predictions
+X.test_tmp$condition <- W.test
+X.test_tmp$converted <- Y.test
+
+# Received gain message and are male (i.e., should have received a gain message)
+X.test_tmp %>% 
+  filter(condition == 0) %>%
+  filter(gender == 0) %>%
+  summarise(n = n(), 
+            gender = mean(gender),
+            base = mean(converted),
+            policy_cate = base) # nothing to add because they already got the right message
+
+# Received gain message and are female (i.e., should have received a loss message)
+X.test_tmp %>% 
+  filter(condition == 0) %>%
+  filter(gender == 1) %>%
+  summarise(n = n(), 
+            gender = mean(gender),
+            base = mean(converted),
+            policy_cate = base + gender_female[1] # estimated saving if they had received a loss message instead
+            )
+```
+
+```{r}
+rate <- rank_average_treatment_effect(cf.test, X.test_tmp$gender)
+rate$estimate
+rate$estimate-1.96*rate$std.err
+rate$estimate+1.96*rate$std.err
+
+ggplot() +
+  geom_line(mapping = aes(x = q, y = estimate), 
+            data=rate$TOC, 
+            color = "#1F77B4", size = 1) +
+  geom_ribbon(mapping = aes(x = q, y = estimate, ymin = estimate-1.96*std.err, ymax = estimate+1.96*std.err),
+              data=rate$TOC, 
+              fill = "#1F77B4", alpha = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1)) +
+  labs(title = "Targeting Operator Characteristic", x = "Treated Fraction", y = "") +
+  theme_bw() + 
+  theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12))
+
+ggsave("RATE by Gender - Saving Amount.png", width = 10, height = 8)
+```
+
+#### By Contract valuation (wealth)
+
+```{r}
+X.test_tmp <- X.test
+
+X.test_policy_low <- X.test_tmp %>%
+  filter(contract_valuation <= median(X.train$contract_valuation))
+
+X.test_policy_high <- X.test_tmp %>%
+  filter(contract_valuation > median(X.train$contract_valuation))
+
+policy_low <- average_treatment_effect_test(cf.train, X.test_policy_low)
+policy_high <- average_treatment_effect_test(cf.train, X.test_policy_high)
+
+policy_df <- data.frame(
+  policy = c("Below Median", "Above Median"),
+  estimate = c(policy_low[1], policy_high[1]),
+  se = c(policy_low[2], policy_high[2]),
+  n = c(nrow(X.test_policy_low), nrow(X.test_policy_high))
+)
+
+policy_df$policy <- factor(policy_df$policy, levels = c("Below Median", "Above Median"))
+
+gate_p5 <- ggplot(data = policy_df) +
+  geom_col(aes(x = policy, y = estimate, fill = policy)) +
+  scale_fill_manual(values = c(`Below Median` = "#A56CBD", `Above Median` = "#1F77B4")) +
+  geom_errorbar(aes(x = policy, ymin = estimate - 1.96 * se, ymax = estimate + 1.96 * se), width = 0.1) +
+  geom_text(aes(x = 1, y = -300), label = paste("N =", scales::label_number(accuracy = NULL, big.mark = ",")(policy_df[1,"n"]))) +
+  geom_text(aes(x = 2, y = -300), label = paste("N =", scales::label_number(accuracy = NULL, big.mark = ",")(policy_df[2,"n"]))) +
+  geom_text(aes(x = 1, y = 900), label = round(policy_df[1,"estimate"],3)) +
+  geom_text(aes(x = 2, y = 900), label = round(policy_df[2,"estimate"],3)) +
+  ylab("Group ATE") +
+  xlab("Contract Valuation") +
+  theme(legend.position = "none") +
+  scale_x_discrete(labels = c("Negative" = expression(pi(x[i]) == 0), "Positive" = expression(pi(x[i]) == 1))) +
+  theme_bw() +
+  theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12)) +
+  theme(legend.position = "none")
+
+gate_p5
+
+ggsave("GATE by Contract Valuation - Saving Amount.png", width = 10, height = 8)
+```
+
+```{r}
+# low -> loss
+# high -> gain
+
+X.test_tmp$cate <- cate.test$predictions
+X.test_tmp$condition <- W.test
+X.test_tmp$converted <- Y.test
+
+# Received gain message and have low value policy (i.e., should have received a loss message)
+X.test_tmp %>% 
+  filter(condition == 0) %>%
+  filter(contract_valuation <= median(X.train$contract_valuation)) %>%
+  summarise(n = n(), 
+            valuation = mean(contract_valuation),
+            base = mean(converted),
+            policy_cate = base + policy_low[1]) # estimated saving if they had received a loss message instead
+
+# Received gain message and have high value policy (i.e., should have received a gain message)
+X.test_tmp %>% 
+  filter(condition == 0) %>%
+  filter(contract_valuation > median(X.train$contract_valuation)) %>%
+  summarise(n = n(), 
+            valuation = mean(contract_valuation),
+            base = mean(converted),
+            policy_cate = base # nothing to add because they already got the right message
+            )
+```
+
+```{r}
+rate <- rank_average_treatment_effect(cf.test, -1*X.test_tmp$contract_valuation)
+rate$estimate
+rate$estimate-1.96*rate$std.err
+rate$estimate+1.96*rate$std.err
+
+ggplot() +
+  geom_line(mapping = aes(x = q, y = estimate), 
+            data=rate$TOC, 
+            color = "#1F77B4", size = 1) +
+  geom_ribbon(mapping = aes(x = q, y = estimate, ymin = estimate-1.96*std.err, ymax = estimate+1.96*std.err),
+              data=rate$TOC, 
+              fill = "#1F77B4", alpha = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1)) +
+  labs(title = "Targeting Operator Characteristic", x = "Treated Fraction", y = "") +
+  theme_bw() + 
+  theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12))
+
+ggsave("RATE by Contract Valuation - Saving Amount.png", width = 10, height = 8)
+```
+
+#### By management skills (financial literacy)
+
+```{r}
+X.test_tmp <- X.test
+
+X.test_mng_low <- X.test_tmp %>%
+  filter(management_skills <= median(X.train$management_skills))
+
+X.test_mng_high <- X.test_tmp %>%
+  filter(management_skills > median(X.train$management_skills))
+
+mng_low <- average_treatment_effect_test(cf.train, X.test_mng_low)
+mng_high <- average_treatment_effect_test(cf.train, X.test_mng_high)
+
+mng_df <- data.frame(
+  mng_skills = c("Below Median", "Above Median"),
+  estimate = c(mng_low[1], mng_high[1]),
+  se = c(mng_low[2], mng_high[2]),
+  n = c(nrow(X.test_mng_low), nrow(X.test_mng_high))
+)
+
+mng_df$mng_skills <- factor(mng_df$mng_skills, levels = c("Below Median", "Above Median"))
+
+gate_p5 <- ggplot(data = mng_df) +
+  geom_col(aes(x = mng_skills, y = estimate, fill = mng_skills)) +
+  scale_fill_manual(values = c(`Below Median` = "#A56CBD", `Above Median` = "#1F77B4")) +
+  geom_errorbar(aes(x = mng_skills, ymin = estimate - 1.96 * se, ymax = estimate + 1.96 * se), width = 0.1) +
+  geom_text(aes(x = 1, y = -200), label = paste("N =", scales::label_number(accuracy = NULL, big.mark = ",")(mng_df[1,"n"]))) +
+  geom_text(aes(x = 2, y = -200), label = paste("N =", scales::label_number(accuracy = NULL, big.mark = ",")(mng_df[2,"n"]))) +
+  geom_text(aes(x = 1, y = 800), label = round(mng_df[1,"estimate"],3)) +
+  geom_text(aes(x = 2, y = 800), label = round(mng_df[2,"estimate"],3)) +
+  ylab("Group ATE") +
+  xlab("Management Skills") +
+  theme(legend.position = "none") +
+  scale_x_discrete(labels = c("Negative" = expression(pi(x[i]) == 0), "Positive" = expression(pi(x[i]) == 1))) +
+  theme_bw() +
+  theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12)) +
+  theme(legend.position = "none")
+
+gate_p5
+
+ggsave("GATE by Mng Skills - Saving Amount.png", width = 10, height = 8)
+```
+
+```{r}
+# low -> loss
+# high -> gain
+
+X.test_tmp$cate <- cate.test$predictions
+X.test_tmp$condition <- W.test
+X.test_tmp$converted <- Y.test
+
+# Received gain message and have high management_skills (i.e., should have received a gain message)
+X.test_tmp %>% 
+  filter(condition == 0) %>%
+  filter(management_skills > median(X.train$management_skills)) %>%
+  summarise(n = n(), 
+            skills = mean(management_skills),
+            base = mean(converted),
+            policy_cate = base) # nothing to add because they already got the right message
+
+# Received gain message and low management_skills (i.e., should have received a loss message)
+X.test_tmp %>% 
+  filter(condition == 0) %>%
+  filter(management_skills <= median(X.train$management_skills)) %>%
+  summarise(n = n(), 
+            skills = mean(management_skills),
+            base = mean(converted),
+            policy_cate = base + mng_low[1] # estimated saving if they had received a loss message instead
+            )
+```
+
+```{r}
+rate <- rank_average_treatment_effect(cf.test, -1*X.test_tmp$management_skills)
+rate$estimate
+rate$estimate-1.96*rate$std.err
+rate$estimate+1.96*rate$std.err
+
+ggplot() +
+  geom_line(mapping = aes(x = q, y = estimate), 
+            data=rate$TOC, 
+            color = "#1F77B4", size = 1) +
+  geom_ribbon(mapping = aes(x = q, y = estimate, ymin = estimate-1.96*std.err, ymax = estimate+1.96*std.err),
+              data=rate$TOC, 
+              fill = "#1F77B4", alpha = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1)) +
+  labs(title = "Targeting Operator Characteristic", x = "Treated Fraction", y = "") +
+  theme_bw() + 
+  theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12))
+
+ggsave("RATE by Mng Skills - Saving Amount.png", width = 10, height = 8)
+```
+
+# Robustness Checks
+
+## Probit
+
+Extensive margin for 2021 and 2022
+
+```{r}
+probit_converted_2021 <- glm(converted ~ condition_3lvl,
+                        family=binomial(link='probit'), 
+                        data=data_started %>% filter(year==2021))
+
+probit_converted_2022 <- glm(converted ~ condition_3lvl,
+                        family=binomial(link='probit'), 
+                        data=data_started %>% filter(year==2022))
+
+stargazer(probit_converted_2021, probit_converted_2022,
+          type = "text", intercept.bottom = FALSE, single.row = TRUE,
+           covariate.labels=c('Constant', 'Received Message: Loss'))
+```
+
+## OLS
+
+Extensive margin for 2021 and 2022
+
+```{r}
+ols_amount_2021 <- lm(log(paid_amount) ~ condition_3lvl,
+                 data=data_finished %>% filter(year==2021))
+
+ols_amount_2022 <- lm(log(paid_amount) ~ condition_3lvl,
+                 data=data_finished %>% filter(year==2022))
+
+stargazer(ols_amount_2021, ols_amount_2022,
+          type = "text", intercept.bottom = FALSE, single.row = TRUE,
+          covariate.labels=c('Constant', 'Received Message: Loss'))
+```
+
+## Heckman Two-step selection
+
+Year 2021 (extensive and intensive)
+
+```{r}
+selection <- selection(
+  converted ~ condition_3lvl +
+    historical_payments_cnt,
+  
+  paid_amount_log ~ condition_3lvl,
+  
+  data = data_started %>% filter(year == 2021),
+  method="2step")
+
+selectionb <- selection
+selectionb$param$index$betaO <- selection$param$index$betaS
+selectionb$param$index$betaS <- selection$param$index$betaO
+
+stargazer(selectionb, selection, type = "text", intercept.bottom = FALSE, single.row = TRUE, dep.var.labels = 'Two step selection',
+                    covariate.labels=c('Constant', 'Received Message: Loss', "Historical Payments"))
+```
+
+Year 2022 (extensive and intensive)
+
+```{r}
+selection <- selection(
+  converted ~ condition_3lvl +
+    historical_payments_cnt,
+  
+  paid_amount_log ~ condition_3lvl,
+  
+  data = data_started %>% filter(year == 2022),
+  method="2step")
+
+
+selectionb <- selection
+selectionb$param$index$betaO <- selection$param$index$betaS
+selectionb$param$index$betaS <- selection$param$index$betaO
+
+stargazer(selectionb, selection, type = "text", intercept.bottom = FALSE, single.row = TRUE, dep.var.labels = 'Two step selection',
+                              covariate.labels=c('Constant', 'Received Message: Loss', "Historical Payments"))
+```
