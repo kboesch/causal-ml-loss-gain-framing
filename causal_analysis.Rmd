@@ -125,7 +125,7 @@ data_started %>%
   )
 
 data_started %>% 
-  group_by(year, condition_3lvl) %>% 
+  group_by(year, condition) %>% 
   summarise(
     avg_conversion = mean(converted)
   )
@@ -151,7 +151,7 @@ data_finished %>%
             sd_amount = sd(paid_amount))
 
 data_finished %>% 
-  group_by(year, condition_3lvl) %>% 
+  group_by(year, condition) %>% 
   summarise(n = n(), 
             mean_amount = mean(paid_amount),
             median_amount = median(paid_amount),
@@ -161,7 +161,9 @@ data_finished %>%
 Covariate summary stats and randomization checks
 
 ```{r}
-st(data_started, group = 'condition', vars = relevant_features, group.test = TRUE)
+st(data_started, group = 'condition', vars = relevant_features, group.test = list(
+    star.cutoffs = c(0.001, 0.01, 0.05)
+  ))
 ```
 
 # Causal ML
@@ -187,11 +189,11 @@ Split data into X, Y, W
 
 ```{r}
 Y.train <- train$converted
-W.train <- ifelse(train$condition_3lvl=='loss', 1, 0)
+W.train <- ifelse(train$condition=='loss', 1, 0)
 X.train <- train[relevant_features]
 
 Y.test <- test$converted
-W.test <- ifelse(test$condition_3lvl=='loss', 1, 0)
+W.test <- ifelse(test$condition=='loss', 1, 0)
 X.test <- test[relevant_features]
 ```
 
@@ -400,7 +402,6 @@ gate_p2 <- ggplot(data = gate_quartiles_df) +
   scale_fill_manual(values = c("-1" = "#A56CBD", "1" = "#1F77B4")) +
   scale_y_continuous(labels = scales::label_percent(accuracy = 0.01, suffix = " %")) +
   geom_errorbar(aes(x = quartile, ymin = estimate - 1.96 * se, ymax = estimate + 1.96 * se), width = 0.1) +
-  #ylim(-0.110, 0.110) + 
   ylab("Group ATE") +
   xlab("CATE Quartile") +
   theme_bw() +
@@ -489,7 +490,6 @@ for (var in vi_df$variable) {
     scale_y_continuous(labels = scales::label_percent(accuracy = 0.01, suffix = " %")) +
     geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
     labs(x = str_wrap(toTitleCase(gsub("_", " ", var)), width = 12), y = "CATE") +
-    #ylim(y = c(-500, 1200)) +
     theme_bw() + 
     theme(text = element_text(size = 10), axis.text.x=element_text(size=8), axis.text.y=element_text(size=8))
 
@@ -536,7 +536,7 @@ fs <- fastshap::explain(
 shap_values <- shapviz(fs, X = X.test)
 
 sv_importance(shap_values, kind = "bee")
-ggsave("SHAP - Beeswarm Conversion.png", width = 10, height = 8)
+ggsave("SHAP - Beeswarm Conversion.pdf", width = 10, height = 8)
 
 ```
 
@@ -913,11 +913,11 @@ Split data into X, Y, W
 
 ```{r}
 Y.train <- train$paid_amount
-W.train <- ifelse(train$condition_3lvl=='loss', 1, 0)
+W.train <- ifelse(train$condition=='loss', 1, 0)
 X.train <- train[relevant_features]
 
 Y.test <- test$paid_amount
-W.test <- ifelse(test$condition_3lvl=='loss', 1, 0)
+W.test <- ifelse(test$condition=='loss', 1, 0)
 X.test <- test[relevant_features]
 ```
 
@@ -961,8 +961,7 @@ summary(cate.test$predictions)
 ```{r}
 cate_p1 <- ggplot(cate.test, aes(x = predictions, fill = cate_direction)) +
   geom_histogram(
-    binwidth = 100, 
-    #alpha = 0.8, 
+    binwidth = 100,
     color = "white",
     boundary  = 0,              # force a bin edge at exactly zero 
     ) +
@@ -971,7 +970,6 @@ cate_p1 <- ggplot(cate.test, aes(x = predictions, fill = cate_direction)) +
     values = c(positive = "#1F77B4", negative = "#A56CBD")
   ) +
   labs(
-    # x = expression(tau),
     x = "CATE (in €)",
     y = "Frequency"
   ) +
@@ -1032,7 +1030,7 @@ ggplot(aes(x = q, y = estimate), data=rate$TOC) +
   theme_bw() + 
   theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12))
 
-ggsave("RATE - Saving Amount.png", width = 10, height = 8)
+ggsave("RATE - Saving Amount.pdf", width = 10, height = 8)
 ```
 
 ### GATE
@@ -1072,8 +1070,6 @@ gate_p1 <- ggplot(data = cate_sign_df) +
   geom_text(aes(x = 2, y = 1200), label = round(cate_sign_df[1,"estimate"],2)) +
   ylab("Group ATE") +
   xlab("Causal ML Policy") +
-  #ylim(-1800, 1800) +
-  # scale_x_discrete(labels = c("Negative" = expression(pi(x[i]) == 0), "Positive" = expression(pi(x[i]) == 1))) +
   scale_x_discrete(labels = c("Negative" = "Not targeted", "Positive" = "Targeted")) +
   theme(legend.position = "none") + 
   theme_bw() +
@@ -1142,7 +1138,6 @@ gate_p2 <- ggplot(data = gate_quartiles_df) +
   scale_fill_manual(values = c("-1" = "#A56CBD", "1" = "#1F77B4")) +
   scale_y_continuous(labels = scales::label_comma()) +
   geom_errorbar(aes(x = quartile, ymin = estimate - 1.96 * se, ymax = estimate + 1.96 * se), width = 0.1) +
- #ylim(-2900, 2900) + 
   ylab("Group ATE") +
   xlab("CATE Quartile") +
   theme_bw() +
@@ -1230,7 +1225,6 @@ for (var in vi_df$variable) {
     geom_ribbon(aes(ymin = pred_lb, ymax = pred_ub), fill = "#1F77B4", alpha = 0.3) +
     geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
     labs(x = str_wrap(toTitleCase(gsub("_", " ", var)), width = 12), y = "CATE") +
-    #ylim(y = c(-500, 1200)) +
     theme_bw() + 
     theme(text = element_text(size = 10), axis.text.x=element_text(size=8), axis.text.y=element_text(size=8))
 
@@ -1275,12 +1269,8 @@ fs <- fastshap::explain(
 # Turn fastshap result into a shapviz object
 shap_values <- shapviz(fs, X = X.test)
 
-# Global importance plots
-#sv_importance(shap_values)
-#ggsave("SHAP - PDP Saving Amount.png", width = 10, height = 8)
-
 sv_importance(shap_values, kind = "bee")
-ggsave("SHAP - Beeswarm Saving Amount.png", width = 10, height = 8)
+ggsave("SHAP - Beeswarm Saving Amount.pdf", width = 10, height = 8)
 
 ```
 
@@ -1384,7 +1374,7 @@ gate_p3 <- ggplot(data = gender_df) +
 
 gate_p3
 
-ggsave("GATE by Gender - Saving Amount.png", width = 10, height = 8)
+ggsave("GATE by Gender - Saving Amount.pdf", width = 10, height = 8)
 ```
 
 ```{r}
@@ -1434,7 +1424,7 @@ ggplot() +
   theme_bw() + 
   theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12))
 
-ggsave("RATE by Gender - Saving Amount.png", width = 10, height = 8)
+ggsave("RATE by Gender - Saving Amount.pdf", width = 10, height = 8)
 ```
 
 #### By Contract valuation (wealth)
@@ -1478,7 +1468,7 @@ gate_p5 <- ggplot(data = policy_df) +
 
 gate_p5
 
-ggsave("GATE by Contract Valuation - Saving Amount.png", width = 10, height = 8)
+ggsave("GATE by Contract Valuation - Saving Amount.pdf", width = 10, height = 8)
 ```
 
 ```{r}
@@ -1528,7 +1518,7 @@ ggplot() +
   theme_bw() + 
   theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12))
 
-ggsave("RATE by Contract Valuation - Saving Amount.png", width = 10, height = 8)
+ggsave("RATE by Contract Valuation - Saving Amount.pdf", width = 10, height = 8)
 ```
 
 #### By management skills (financial literacy)
@@ -1572,7 +1562,7 @@ gate_p5 <- ggplot(data = mng_df) +
 
 gate_p5
 
-ggsave("GATE by Mng Skills - Saving Amount.png", width = 10, height = 8)
+ggsave("GATE by Mng Skills - Saving Amount.pdf", width = 10, height = 8)
 ```
 
 ```{r}
@@ -1622,7 +1612,7 @@ ggplot() +
   theme_bw() + 
   theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12))
 
-ggsave("RATE by Mng Skills - Saving Amount.png", width = 10, height = 8)
+ggsave("RATE by Mng Skills - Saving Amount.pdf", width = 10, height = 8)
 ```
 
 # Robustness Checks
@@ -1632,11 +1622,11 @@ ggsave("RATE by Mng Skills - Saving Amount.png", width = 10, height = 8)
 Extensive margin for 2021 and 2022
 
 ```{r}
-probit_converted_2021 <- glm(converted ~ condition_3lvl,
+probit_converted_2021 <- glm(converted ~ condition,
                         family=binomial(link='probit'), 
                         data=data_started %>% filter(year==2021))
 
-probit_converted_2022 <- glm(converted ~ condition_3lvl,
+probit_converted_2022 <- glm(converted ~ condition,
                         family=binomial(link='probit'), 
                         data=data_started %>% filter(year==2022))
 
@@ -1650,10 +1640,10 @@ stargazer(probit_converted_2021, probit_converted_2022,
 Extensive margin for 2021 and 2022
 
 ```{r}
-ols_amount_2021 <- lm(log(paid_amount) ~ condition_3lvl,
+ols_amount_2021 <- lm(log(paid_amount) ~ condition,
                  data=data_finished %>% filter(year==2021))
 
-ols_amount_2022 <- lm(log(paid_amount) ~ condition_3lvl,
+ols_amount_2022 <- lm(log(paid_amount) ~ condition,
                  data=data_finished %>% filter(year==2022))
 
 stargazer(ols_amount_2021, ols_amount_2022,
@@ -1667,10 +1657,10 @@ Year 2021 (extensive and intensive)
 
 ```{r}
 selection <- selection(
-  converted ~ condition_3lvl +
+  converted ~ condition +
     historical_payments_cnt,
   
-  paid_amount_log ~ condition_3lvl,
+  paid_amount_log ~ condition,
   
   data = data_started %>% filter(year == 2021),
   method="2step")
@@ -1687,10 +1677,10 @@ Year 2022 (extensive and intensive)
 
 ```{r}
 selection <- selection(
-  converted ~ condition_3lvl +
+  converted ~ condition +
     historical_payments_cnt,
   
-  paid_amount_log ~ condition_3lvl,
+  paid_amount_log ~ condition,
   
   data = data_started %>% filter(year == 2022),
   method="2step")
