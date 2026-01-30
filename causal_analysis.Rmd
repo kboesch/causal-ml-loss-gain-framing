@@ -1660,7 +1660,7 @@ selection <- selection(
   converted ~ condition +
     historical_payments_cnt,
   
-  paid_amount_log ~ condition,
+  log(paid_amount) ~ condition,
   
   data = data_started %>% filter(year == 2021),
   method="2step")
@@ -1680,7 +1680,7 @@ selection <- selection(
   converted ~ condition +
     historical_payments_cnt,
   
-  paid_amount_log ~ condition,
+  log(paid_amount) ~ condition,
   
   data = data_started %>% filter(year == 2022),
   method="2step")
