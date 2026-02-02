@@ -239,16 +239,16 @@ Distribution of CATE
 cate_p1 <- ggplot(cate.test, aes(x = predictions, fill = cate_direction)) +
   geom_histogram(binwidth = 0.01, color = "white", boundary  = 0) +
   scale_fill_manual(name = "Direction", values = c(positive = "#1F77B4", negative = "#A56CBD")) +
-  scale_x_continuous(labels = scales::label_percent(accuracy = 0.01, suffix = " %")) +
+  scale_x_continuous(labels = scales::label_number(accuracy = 0.01, scale = 100)) +
   scale_y_continuous(labels = scales::label_comma()) +
-  labs(x = "CATE (in percent)", y = "Frequency") +
+  labs(x = "CATE", y = "Frequency") +
   geom_vline(xintercept=ate[1]) +
   geom_vline(xintercept=c(ate[1]-1.96*ate[2],ate[1]+1.96*ate[2]), linetype="dashed") +
   theme_bw() + 
   theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12)) +
   theme(legend.position = "none") +
   annotate("text", x = 0.15, y = 3000, 
-           label = sprintf("ATE: %.3f%% [95%% CI: %.3f%%, %.3f%%]", 
+           label = sprintf("ATE: %.3f [95%% CI: %.3f, %.3f]", 
                            ate[1]*100, 
                            (ate[1]-1.96*ate[2])*100, 
                            (ate[1]+1.96*ate[2])*100)) +
@@ -260,10 +260,10 @@ cate_p1 <- ggplot(cate.test, aes(x = predictions, fill = cate_direction)) +
            arrow = arrow(length = unit(0.3, "cm")), linewidth = 1) +
   
   annotate("text", x = 0.15, y = 1300, 
-           label = "Respond positively\nto loss-framing", size = 4) +
+           label = "Respond positively\nto loss framing", size = 4) +
 
   annotate("text", x = -0.15, y = 1300, 
-           label = "Respond positively\nto gain-framing", size = 4) +
+           label = "Respond positively\nto gain framing", size = 4) +
   
   coord_cartesian(xlim = c(-0.25, 0.25))
 
@@ -304,7 +304,7 @@ ggplot() +
               fill = "#1F77B4", alpha = 0.2) +
   geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
   scale_x_continuous(breaks = seq(0, 1, by = 0.1)) +
-  scale_y_continuous(labels = scales::label_percent(accuracy = 0.01, suffix = " %")) +
+  scale_y_continuous(labels = scales::label_number(accuracy = 0.01, scale = 100)) +
   labs(title = "Targeting Operator Characteristic", x = "Treated Fraction", y = "") +
   theme_bw() + 
   theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12))
@@ -347,9 +347,9 @@ gate_p1 <- ggplot(data = cate_sign_df) +
   geom_errorbar(aes(x = cate_sign, ymin = estimate - 1.96 * se, ymax = estimate + 1.96 * se), width = 0.1) +
   geom_text(aes(x = 1, y = -0.01), label = paste("N =", scales::label_number(accuracy = NULL, big.mark = ",")(cate_sign_df[2,"n"]))) +
   geom_text(aes(x = 2, y = 0.01), label = paste("N =", scales::label_number(accuracy = NULL, big.mark = ",")(cate_sign_df[1,"n"]))) +
-  geom_text(aes(x = 1, y = -0.065), label = paste0(round(cate_sign_df[2,"estimate"]*100,3), " %")) +
-  geom_text(aes(x = 2, y = 0.065), label = paste0(round(cate_sign_df[1,"estimate"]*100,3), " %")) +
-  scale_y_continuous(labels = scales::label_percent(accuracy = 0.01, suffix = " %")) +
+  geom_text(aes(x = 1, y = -0.065), label = round(cate_sign_df[2,"estimate"]*100,3)) +
+  geom_text(aes(x = 2, y = 0.065), label = round(cate_sign_df[1,"estimate"]*100,3)) +
+  scale_y_continuous(labels = scales::label_number(accuracy = 0.01, scale = 100)) +
   ylab("Group ATE") +
   xlab("Causal ML Policy") +
   theme(legend.position = "none") +
@@ -400,7 +400,7 @@ gate_quartiles_df <- data.frame(
 gate_p2 <- ggplot(data = gate_quartiles_df) +
   geom_col(aes(x = quartile, y = estimate, fill = sign)) +
   scale_fill_manual(values = c("-1" = "#A56CBD", "1" = "#1F77B4")) +
-  scale_y_continuous(labels = scales::label_percent(accuracy = 0.01, suffix = " %")) +
+  scale_y_continuous(labels = scales::label_number(accuracy = 0.01, scale = 100)) +
   geom_errorbar(aes(x = quartile, ymin = estimate - 1.96 * se, ymax = estimate + 1.96 * se), width = 0.1) +
   ylab("Group ATE") +
   xlab("CATE Quartile") +
@@ -487,7 +487,7 @@ for (var in vi_df$variable) {
   p <- ggplot(pdp_df, aes(x = value, y = pred_point)) +
     geom_line(color = "#1F77B4", size = 1) +
     geom_ribbon(aes(ymin = pred_lb, ymax = pred_ub), fill = "#1F77B4", alpha = 0.3) +
-    scale_y_continuous(labels = scales::label_percent(accuracy = 0.01, suffix = " %")) +
+    scale_y_continuous(labels = scales::label_number(accuracy = 0.01, scale = 100)) +
     geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
     labs(x = str_wrap(toTitleCase(gsub("_", " ", var)), width = 12), y = "CATE") +
     theme_bw() + 
@@ -633,13 +633,13 @@ gate_p3 <- ggplot(data = gender_df) +
   geom_errorbar(aes(x = gender, ymin = estimate - 1.96 * se, ymax = estimate + 1.96 * se), width = 0.1) +
   geom_text(aes(x = 1, y = -0.015), label = paste("N =", scales::label_number(accuracy = NULL, big.mark = ",")(gender_df[2,"n"]))) +
   geom_text(aes(x = 2, y = -0.015), label = paste("N =", scales::label_number(accuracy = NULL, big.mark = ",")(gender_df[1,"n"]))) +
-  geom_text(aes(x = 1, y = 0.02), label = paste0(round(gender_df[2,"estimate"]*100,3), " %")) + # NEW
-  geom_text(aes(x = 2, y = 0.02), label = paste0(round(gender_df[1,"estimate"]*100,3), " %")) + # NEW
+  geom_text(aes(x = 1, y = 0.02), label = round(gender_df[2,"estimate"]*100,3)) +
+  geom_text(aes(x = 2, y = 0.02), label = round(gender_df[1,"estimate"]*100,3)) +
   ylab("Group ATE") +
   xlab("Gender") +
   theme(legend.position = "none") +
   scale_x_discrete(labels = c("Negative" = expression(pi(x[i]) == 0), "Positive" = expression(pi(x[i]) == 1))) +
-  scale_y_continuous(labels = scales::label_percent(accuracy = 0.01, suffix = " %")) + # NEW
+  scale_y_continuous(labels = scales::label_number(accuracy = 0.01, scale = 100)) +
   theme_bw() +
   theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12)) +
   theme(legend.position = "none")
@@ -692,7 +692,7 @@ ggplot() +
               fill = "#1F77B4", alpha = 0.2) +
   geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
   scale_x_continuous(breaks = seq(0, 1, by = 0.1)) +
-  scale_y_continuous(labels = scales::label_percent(accuracy = 0.01, suffix = " %")) + # NEW
+  scale_y_continuous(labels = scales::label_number(accuracy = 0.01, scale = 100)) +
   labs(title = "Targeting Operator Characteristic", x = "Treated Fraction", y = "") +
   theme_bw() + 
   theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12))
@@ -729,13 +729,13 @@ gate_p5 <- ggplot(data = policy_df) +
   geom_errorbar(aes(x = policy, ymin = estimate - 1.96 * se, ymax = estimate + 1.96 * se), width = 0.1) +
   geom_text(aes(x = 1, y = -0.015), label = paste("N =", scales::label_number(accuracy = NULL, big.mark = ",")(policy_df[1,"n"]))) +
   geom_text(aes(x = 2, y = -0.015), label = paste("N =", scales::label_number(accuracy = NULL, big.mark = ",")(policy_df[2,"n"]))) +
-  geom_text(aes(x = 1, y = 0.025), label = paste0(round(policy_df[1,"estimate"]*100,3), " %")) + # NEW
-  geom_text(aes(x = 2, y = 0.025), label = paste0(round(policy_df[2,"estimate"]*100,3), " %")) + # NEW
+  geom_text(aes(x = 1, y = 0.025), label = round(policy_df[1,"estimate"]*100,3)) + 
+  geom_text(aes(x = 2, y = 0.025), label = round(policy_df[2,"estimate"]*100,3)) + 
   ylab("Group ATE") +
   xlab("Contract Valuation") +
   theme(legend.position = "none") +
   scale_x_discrete(labels = c("Negative" = expression(pi(x[i]) == 0), "Positive" = expression(pi(x[i]) == 1))) +
-  scale_y_continuous(labels = scales::label_percent(accuracy = 0.01, suffix = " %")) + # NEW
+  scale_y_continuous(labels = scales::label_number(accuracy = 0.01, scale = 100)) +
   theme_bw() +
   theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12)) +
   theme(legend.position = "none")
@@ -788,7 +788,7 @@ ggplot() +
               fill = "#1F77B4", alpha = 0.2) +
   geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
   scale_x_continuous(breaks = seq(0, 1, by = 0.1)) +
-  scale_y_continuous(labels = scales::label_percent(accuracy = 0.01, suffix = " %")) + # NEW
+  scale_y_continuous(labels = scales::label_number(accuracy = 0.01, scale = 100)) +
   labs(title = "Targeting Operator Characteristic", x = "Treated Fraction", y = "") +
   theme_bw() + 
   theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12))
@@ -825,13 +825,13 @@ gate_p5 <- ggplot(data = mng_df) +
   geom_errorbar(aes(x = mng_skills, ymin = estimate - 1.96 * se, ymax = estimate + 1.96 * se), width = 0.1) +
   geom_text(aes(x = 1, y = -0.015), label = paste("N =", scales::label_number(accuracy = NULL, big.mark = ",")(mng_df[1,"n"]))) +
   geom_text(aes(x = 2, y = -0.015), label = paste("N =", scales::label_number(accuracy = NULL, big.mark = ",")(mng_df[2,"n"]))) +
-  geom_text(aes(x = 1, y = 0.025), label = paste0(round(mng_df[1,"estimate"]*100,3), " %")) + # NEW
-  geom_text(aes(x = 2, y = 0.025), label = paste0(round(mng_df[2,"estimate"]*100,3), " %")) + # NEW
+  geom_text(aes(x = 1, y = 0.025), label = round(mng_df[1,"estimate"]*100,3)) + 
+  geom_text(aes(x = 2, y = 0.025), label = round(mng_df[2,"estimate"]*100,3)) + 
   ylab("Group ATE") +
   xlab("Management Skills") +
   theme(legend.position = "none") +
   scale_x_discrete(labels = c("Negative" = expression(pi(x[i]) == 0), "Positive" = expression(pi(x[i]) == 1))) +
-  scale_y_continuous(labels = scales::label_percent(accuracy = 0.01, suffix = " %")) + #NEW
+  scale_y_continuous(labels = scales::label_number(accuracy = 0.01, scale = 100)) +
   theme_bw() +
   theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12)) +
   theme(legend.position = "none")
@@ -884,7 +884,7 @@ ggplot() +
               fill = "#1F77B4", alpha = 0.2) +
   geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
   scale_x_continuous(breaks = seq(0, 1, by = 0.1)) +
-  scale_y_continuous(labels = scales::label_percent(accuracy = 0.01, suffix = " %")) + #NEW
+  scale_y_continuous(labels = scales::label_number(accuracy = 0.01, scale = 100)) +
   labs(title = "Targeting Operator Characteristic", x = "Treated Fraction", y = "") +
   theme_bw() + 
   theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12))
@@ -959,6 +959,9 @@ summary(cate.test$predictions)
 ```
 
 ```{r}
+library(showtext)
+showtext_auto()
+
 cate_p1 <- ggplot(cate.test, aes(x = predictions, fill = cate_direction)) +
   geom_histogram(
     binwidth = 100,
@@ -970,7 +973,7 @@ cate_p1 <- ggplot(cate.test, aes(x = predictions, fill = cate_direction)) +
     values = c(positive = "#1F77B4", negative = "#A56CBD")
   ) +
   labs(
-    x = "CATE (in €)",
+    x = "CATE (in \u20AC)",
     y = "Frequency"
   ) +
   scale_x_continuous(labels = scales::label_comma()) +
@@ -988,12 +991,14 @@ cate_p1 <- ggplot(cate.test, aes(x = predictions, fill = cate_direction)) +
            arrow = arrow(length = unit(0.3, "cm")), linewidth = 1) +
   
   annotate("text", x = 2000, y = 30, 
-           label = "Respond positively\nto loss-framing", size = 4) +
+           label = "Respond positively\nto loss framing", size = 4) +
 
   annotate("text", x = -2000, y = 30, 
-           label = "Respond positively\nto gain-framing", size = 4) +
+           label = "Respond positively\nto gain framing", size = 4) +
   
   coord_cartesian(xlim = c(-3100, 3100))
+
+showtext_auto(FALSE)
 
 cate_p1
 ```
@@ -1153,7 +1158,9 @@ plot_grid(cate_p1, gate_p2, gate_p1, labels = c('a', 'b', 'c'),
           scale = c(.9, .9, .9)
           )
 
-ggsave("CATE_GATE - Saving Amount.pdf", width = 10, height = 8)
+ggsave("CATE_GATE - Saving Amount.png", 
+       width = 10, 
+       height = 8)
 ```
 
 ### XAI
