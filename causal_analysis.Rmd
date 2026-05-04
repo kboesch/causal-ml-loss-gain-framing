@@ -248,7 +248,7 @@ cate_p1 <- ggplot(cate.test, aes(x = predictions, fill = cate_direction)) +
   theme(text = element_text(size = 14), axis.text.x=element_text(size=12), axis.text.y=element_text(size=12)) +
   theme(legend.position = "none") +
   annotate("text", x = 0.15, y = 3000, 
-           label = sprintf("ATE: %.3f [95%% CI: %.3f, %.3f]", 
+           label = sprintf("ATE: %.3f%% [95%% CI: %.3f%%, %.3f%%]", 
                            ate[1]*100, 
                            (ate[1]-1.96*ate[2])*100, 
                            (ate[1]+1.96*ate[2])*100)) +
@@ -1091,7 +1091,7 @@ detailed_proportions <- X.test_tmp %>%
   summarise(
     # pos/neg proportions
     prop_positive = mean(cate > 0, na.rm = TRUE),
-    prop_negative = mean(cate < 0, na.rm = TRUE),
+    prop_negative = mean(cate <= 0, na.rm = TRUE),
     
     # interesting thresholds
     prop_gt_500   = mean(cate > 500, na.rm = TRUE),
@@ -1158,9 +1158,12 @@ plot_grid(cate_p1, gate_p2, gate_p1, labels = c('a', 'b', 'c'),
           scale = c(.9, .9, .9)
           )
 
+
+ggsave("CATE_GATE - Saving Amount.png", width = 10, height = 8)
 ggsave("CATE_GATE - Saving Amount.png", 
        width = 10, 
        height = 8)
+
 ```
 
 ### XAI
